@@ -1,0 +1,31 @@
+# 网关自身配置
+gateway:
+  port: 8080
+  # JWT 密钥，用于验证传入的 Token
+  jwt_secret: "ehiK/cBywih1xBgBeARZ8w=="
+
+# ==================================
+# 上游服务定义
+# ==================================
+services:
+  # 示例 HTTP 服务
+  user-service:
+    addr: "http://localhost:8081"
+    type: "http" # 代理类型: http, rpc (gRPC)
+
+# ==================================
+# 路由规则定义
+# ==================================
+routes:
+  - id: "r1"
+    path: "/api/v1/user"
+    service_id: "user-service"
+    middlewares:
+      - name: "jwt"
+      - name: "rate_limit"
+        param: "10/s" # 每秒允许 10 个请求
+
+  - id: "r2"
+    path: "/api/v1/public"
+    service_id: "user-service"
+    middlewares: [] # 公开接口，无中间件
