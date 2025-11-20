@@ -1,115 +1,203 @@
 package router
 
 import (
-	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/RunzhiZhao/long-gate/internal/config"
-	"github.com/RunzhiZhao/long-gate/internal/middleware"
-	"github.com/RunzhiZhao/long-gate/internal/proxy"
 )
 
-// RouteEntry 存储一个路由的所有信息，包括服务和中间件链
-type RouteEntry struct {
-	Config  config.RouteConfig
-	Service config.ServiceConfig
-	Proxy   http.Handler // 使用 http.Handler 统一接口
+// Router 路由引擎
+type Router struct {
+	routes atomic.Value // *RouteTable，支持原子更新
+	mu     sync.RWMutex
 }
 
-// RouterManager 负责管理路由表
-type RouterManager struct {
-	mu sync.RWMutex
-	// 路由表：使用 Path 作为 Key 快速查找
-	routes map[string]*RouteEntry
+// RouteTable 路由表（不可变结构）
+type RouteTable struct {
+	routes   []*config.Route
+	indexMap map[string]*config.Route // id -> route 快速查找
 }
 
-var globalRouter *RouterManager
-
-func InitRouter() {
-	globalRouter = &RouterManager{
-		routes: make(map[string]*RouteEntry),
-	}
-	// 初始加载路由（尽管 LoadAndWatchConfig 已经做了一次，这里确保初始化）
-	globalRouter.updateRoutes()
+// NewRouter 创建路由引擎
+func NewRouter() *Router {
+	r := &Router{}
+	r.routes.Store(&RouteTable{
+		routes:   make([]*config.Route, 0),
+		indexMap: make(map[string]*config.Route),
+	})
+	return r
 }
 
-// updateRoutes 从配置中重新加载路由表，实现热更新
-func (rm *RouterManager) updateRoutes() {
-	newRoutes := make(map[string]*RouteEntry)
-
-	for _, routeCfg := range config.GetRoutes() {
-		svcCfg, ok := config.GetServiceConfig(routeCfg.ServiceID)
-		if !ok {
-			fmt.Printf("Warning: Service ID '%s' not found for route '%s'\n", routeCfg.ServiceID, routeCfg.Path)
-			continue
+// LoadRoutes 加载路由表（全量替换）
+func (r *Router) LoadRoutes(routes []*config.Route) error {
+	// 验证并排序路由（按优先级降序）
+	validRoutes := make([]*config.Route, 0, len(routes))
+	for _, route := range routes {
+		if err := route.Validate(); err != nil {
+			continue // 跳过无效路由
 		}
-
-		var p http.Handler
-		var err error
-
-		// 根据服务类型选择代理实现
-		switch svcCfg.Type {
-		case "http":
-			p, err = proxy.NewHTTPProxy(svcCfg.Addr)
-		// case "rpc":
-		// ⚠️ 暂不实现 rpc 代理的 NewRPCProxy，MVP 只支持 http
-		// p, err = proxy.NewRPCProxy(svcCfg.Addr)
-		default:
-			fmt.Printf("Warning: Unknown service type '%s' for service '%s'\n", svcCfg.Type, routeCfg.ServiceID)
-			continue
-		}
-
-		if err != nil {
-			fmt.Printf("Error creating proxy for route '%s': %v\n", routeCfg.Path, err)
-			continue
-		}
-
-		newRoutes[routeCfg.Path] = &RouteEntry{
-			Config:  routeCfg,
-			Service: svcCfg,
-			Proxy:   p,
-		}
+		validRoutes = append(validRoutes, route)
 	}
 
-	// 原子替换路由表
-	rm.mu.Lock()
-	rm.routes = newRoutes
-	rm.mu.Unlock()
+	// 按优先级排序（优先级高的在前）
+	sort.Slice(validRoutes, func(i, j int) bool {
+		return validRoutes[i].Priority > validRoutes[j].Priority
+	})
 
-	fmt.Printf("Routes successfully updated. Total active routes: %d\n", len(newRoutes))
-}
-
-// HandleRequest 是网关的统一入口处理函数
-func HandleRequest(w http.ResponseWriter, r *http.Request) {
-	// 路由查找
-	routeEntry, ok := globalRouter.getRoute(r.URL.Path)
-	if !ok {
-		http.Error(w, "Route Not Found", http.StatusNotFound)
-		return
+	// 构建新的路由表
+	newTable := &RouteTable{
+		routes:   validRoutes,
+		indexMap: make(map[string]*config.Route),
+	}
+	for _, route := range validRoutes {
+		newTable.indexMap[route.ID] = route
 	}
 
-	// 创建并执行中间件链
-	chain := middleware.NewChain(routeEntry.Config)
-	if !chain.Execute(w, r) {
-		// 中间件返回 false，请求已被中断和响应（如鉴权失败）
-		return
-	}
-
-	// 执行反向代理
-	routeEntry.Proxy.ServeHTTP(w, r)
+	// 原子替换
+	r.routes.Store(newTable)
+	return nil
 }
 
-// getRoute 查找匹配的路由
-func (rm *RouterManager) getRoute(path string) (*RouteEntry, bool) {
-	// ⚠️ 注意：为了简单 MVP，这里只进行精确匹配。
-	// 生产环境应使用高性能路由库（如 go-chi/patricia-trie）进行前缀和模糊匹配。
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
+// AddRoute 添加单个路由（增量更新）
+func (r *Router) AddRoute(route *config.Route) error {
+	if err := route.Validate(); err != nil {
+		return err
+	}
 
-	// 每次查找时，尝试更新路由，确保配置中心更改能及时生效
-	globalRouter.updateRoutes()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	entry, ok := rm.routes[path]
-	return entry, ok
+	oldTable := r.routes.Load().(*RouteTable)
+
+	// 创建新路由列表
+	newRoutes := make([]*config.Route, 0, len(oldTable.routes)+1)
+	replaced := false
+
+	for _, existing := range oldTable.routes {
+		if existing.ID == route.ID {
+			newRoutes = append(newRoutes, route) // 替换
+			replaced = true
+		} else {
+			newRoutes = append(newRoutes, existing)
+		}
+	}
+
+	if !replaced {
+		newRoutes = append(newRoutes, route) // 新增
+	}
+
+	// 重新排序
+	sort.Slice(newRoutes, func(i, j int) bool {
+		return newRoutes[i].Priority > newRoutes[j].Priority
+	})
+
+	// 构建新表
+	newTable := &RouteTable{
+		routes:   newRoutes,
+		indexMap: make(map[string]*config.Route),
+	}
+	for _, r := range newRoutes {
+		newTable.indexMap[r.ID] = r
+	}
+
+	r.routes.Store(newTable)
+	return nil
+}
+
+// DeleteRoute 删除路由
+func (r *Router) DeleteRoute(routeID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	oldTable := r.routes.Load().(*RouteTable)
+
+	newRoutes := make([]*config.Route, 0, len(oldTable.routes))
+	for _, route := range oldTable.routes {
+		if route.ID != routeID {
+			newRoutes = append(newRoutes, route)
+		}
+	}
+
+	newTable := &RouteTable{
+		routes:   newRoutes,
+		indexMap: make(map[string]*config.Route),
+	}
+	for _, r := range newRoutes {
+		newTable.indexMap[r.ID] = r
+	}
+
+	r.routes.Store(newTable)
+	return nil
+}
+
+// Match 匹配路由
+func (r *Router) Match(req *http.Request) (*config.Route, map[string]string) {
+	table := r.routes.Load().(*RouteTable)
+
+	path := req.URL.Path
+	method := req.Method
+	host := req.Host
+	headers := extractHeaders(req)
+
+	// 按优先级顺序匹配
+	for _, route := range table.routes {
+		if route.Match(path, method, host, headers) {
+			// 提取路径参数（如果是参数化路由）
+			params := extractPathParams(route.Predicates.Path, path)
+			return route, params
+		}
+	}
+
+	return nil, nil
+}
+
+// GetRoute 根据 ID 获取路由
+func (r *Router) GetRoute(id string) *config.Route {
+	table := r.routes.Load().(*RouteTable)
+	return table.indexMap[id]
+}
+
+// ListRoutes 获取所有路由
+func (r *Router) ListRoutes() []*config.Route {
+	table := r.routes.Load().(*RouteTable)
+	routes := make([]*config.Route, len(table.routes))
+	copy(routes, table.routes)
+	return routes
+}
+
+// extractHeaders 提取 HTTP 头部
+func extractHeaders(req *http.Request) map[string]string {
+	headers := make(map[string]string)
+	for key, values := range req.Header {
+		if len(values) > 0 {
+			headers[key] = values[0]
+		}
+	}
+	return headers
+}
+
+// extractPathParams 提取路径参数 (简单实现)
+// 如: pattern=/api/users/:id, path=/api/users/123 -> {id: "123"}
+func extractPathParams(pattern, path string) map[string]string {
+	params := make(map[string]string)
+
+	patternParts := strings.Split(strings.Trim(pattern, "/"), "/")
+	pathParts := strings.Split(strings.Trim(path, "/"), "/")
+
+	if len(patternParts) != len(pathParts) {
+		return params
+	}
+
+	for i, part := range patternParts {
+		if strings.HasPrefix(part, ":") {
+			paramName := strings.TrimPrefix(part, ":")
+			params[paramName] = pathParts[i]
+		}
+	}
+
+	return params
 }

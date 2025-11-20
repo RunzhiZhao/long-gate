@@ -1,60 +1,39 @@
 package middleware
 
-import (
-	"net/http"
+// HandlerFunc 处理函数
+type HandlerFunc func(*Context)
 
-	"github.com/RunzhiZhao/long-gate/internal/config"
-)
+// Middleware 中间件函数
+type Middleware func(HandlerFunc) HandlerFunc
 
-// HandlerFunc 定义中间件的核心处理函数签名
-type HandlerFunc func(w http.ResponseWriter, r *http.Request) bool
-
-// Middleware 接口定义所有中间件必须实现的方法
-type Middleware interface {
-	Name() string
-	Process(w http.ResponseWriter, r *http.Request) bool // 返回 true 继续执行，返回 false 中断请求
-}
-
-// Chain 结构体持有所有需要执行的中间件
+// Chain 中间件链
 type Chain struct {
 	middlewares []Middleware
 }
 
-// NewChain 创建一个新的中间件链
-func NewChain(routeCfg config.RouteConfig) *Chain {
-	c := &Chain{}
-
-	// 根据配置加载和初始化中间件
-	for _, mwCfg := range routeCfg.Middlewares {
-		var mw Middleware
-
-		switch mwCfg.Name {
-		case "jwt":
-			// ⚠️ 密钥应从配置中获取
-			jwtSecret := config.GetGatewayConfig().JWTSecret
-			mw = NewJWTMiddleware(jwtSecret)
-		case "rate_limit":
-			// ⚠️ 参数解析应更健壮，这里简化处理
-			mw = NewRateLimitMiddleware(mwCfg.Param)
-		// 可以添加更多的中间件...
-		default:
-			// 忽略未知的中间件
-			continue
-		}
-
-		c.middlewares = append(c.middlewares, mw)
+// NewChain 创建中间件链
+func NewChain(middlewares ...Middleware) *Chain {
+	return &Chain{
+		middlewares: middlewares,
 	}
-
-	return c
 }
 
-// Execute 依次执行链中的所有中间件
-func (c *Chain) Execute(w http.ResponseWriter, r *http.Request) bool {
-	for _, mw := range c.middlewares {
-		// 只要有一个中间件返回 false，就中断后续执行
-		if !mw.Process(w, r) {
-			return false
-		}
+// Then 应用中间件链到最终处理器
+func (c *Chain) Then(final HandlerFunc) HandlerFunc {
+	// 从后往前包装
+	handler := final
+	for i := len(c.middlewares) - 1; i >= 0; i-- {
+		handler = c.middlewares[i](handler)
 	}
-	return true
+	return handler
+}
+
+// Append 追加中间件
+func (c *Chain) Append(m ...Middleware) *Chain {
+	newChain := &Chain{
+		middlewares: make([]Middleware, len(c.middlewares)+len(m)),
+	}
+	copy(newChain.middlewares, c.middlewares)
+	copy(newChain.middlewares[len(c.middlewares):], m)
+	return newChain
 }
